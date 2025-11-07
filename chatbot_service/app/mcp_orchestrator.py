@@ -1,16 +1,19 @@
 import openai
 from app.rag_engine import CompanyRAG, NavigationRAG
+from app.model_manager import ModelManager
 
-MODEL = "llama3-8b-8192"
+# Initialize model manager for dynamic model selection
+model_manager = ModelManager()
 MAX_CONTEXT_MESSAGES = 15
 
 system_instructions = (
-    "You are Aarvasa's friendly AI assistant helping users with anything related to real estate and the company. "
+    "You are Aarvasa's AI assistant. Your main focus is to assist with real estate-related questions and company-specific information. "
+    "For anything not related to real estate or Aarvasa, politely let the user know that you can only help with real estate or company matters. "
+    "Do not answer questions outside of this scope (e.g., coding, general knowledge). "
+    "If a question is unrelated, reply with: 'Sorry, I can only assist with real estate and Aarvasa-related topics.' "
     "Use the company context file to answer questions when possible. "
-    "Be helpful, friendly, and give short, clear responses. "
-    "If you don't know the answer, say so politely. "
-    "Anything related to showing properties tell them to go to the listings page. "
-    "Keep your answers as small as possible — maximum 3 lines for general company-related questions."
+    "Keep responses concise and under 3 lines for company-related inquiries. "
+    "For property listings, always direct users to the listings page."
 )
 
 class MCPOrchestrator:
@@ -64,20 +67,35 @@ class MCPOrchestrator:
 
         messages.append({"role": "user", "content": user_message})
 
-        try:
-            stream = openai.ChatCompletion.create(
-                model=MODEL,
-                messages=messages,
-                temperature=0.5,
-                stream=True
-            )
+        # Get best available model dynamically
+        current_model = model_manager.get_best_model()
+        available_models = model_manager.get_available_models()
 
-            for chunk in stream:
-                if "choices" in chunk and chunk.choices[0].delta.get("content"):
-                    yield chunk.choices[0].delta.content
+        # Try streaming with fallback logic
+        for attempt, model_to_use in enumerate(available_models):
+            try:
+                stream = openai.ChatCompletion.create(
+                    model=model_to_use,
+                    messages=messages,
+                    temperature=0.5,
+                    stream=True
+                )
 
-        except Exception as e:
-            yield f"\n[Error] {str(e)}"
+                for chunk in stream:
+                    if "choices" in chunk and chunk.choices[0].delta.get("content"):
+                        yield chunk.choices[0].delta.content
+                
+                return  # Successfully completed, exit
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if ("model" in error_msg or "not found" in error_msg) and attempt < len(available_models) - 1:
+                    print(f"⚠️ Model {model_to_use} failed in streaming, trying next model...")
+                    model_manager.clear_cache()  # Clear cache to get fresh models
+                    continue
+                else:
+                    yield f"\n[Error] {str(e)}"
+                    return
 
     def _handle_company_info(self, message, history):
         context = self.company_rag.retrieve_relevant_chunks(message)
@@ -94,13 +112,30 @@ class MCPOrchestrator:
 
         messages.append({"role": "user", "content": message})
 
-        response = openai.ChatCompletion.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.5,
-        )
-
-        return response.choices[0].message["content"].strip()
+        # Get best available model dynamically
+        current_model = model_manager.get_best_model()
+        available_models = model_manager.get_available_models()
+        
+        # Try with fallback logic
+        for attempt, model_to_use in enumerate(available_models):
+            try:
+                response = openai.ChatCompletion.create(
+                    model=model_to_use,
+                    messages=messages,
+                    temperature=0.5,
+                )
+                return response.choices[0].message["content"].strip()
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if ("model" in error_msg or "not found" in error_msg) and attempt < len(available_models) - 1:
+                    print(f"⚠️ Model {model_to_use} failed, trying next model...")
+                    model_manager.clear_cache()  # Clear cache to get fresh models
+                    continue
+                else:
+                    raise e
+        
+        return None
 
     def _handle_navigation(self, message):
         nav_result = self.nav_rag.retrieve_navigation_info(message, top_k=1)
